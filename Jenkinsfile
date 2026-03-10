@@ -16,6 +16,7 @@ pipeline {
     stage('Install AWS CLI (v2) ') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if ! command -v aws >/dev/null 2>&1; then
             curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
@@ -34,6 +35,7 @@ pipeline {
           string(credentialsId: 'aws_secret_access_key', variable: 'AWS_SECRET_ACCESS_KEY')
         ]) {
           sh '''
+            #!/bin/bash
             set -euxo pipefail
             aws configure set aws_access_key_id     "$AWS_ACCESS_KEY_ID"
             aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
@@ -47,6 +49,7 @@ pipeline {
     stage('Install Terraform (HashiCorp APT)') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if ! command -v terraform >/dev/null 2>&1; then
             sudo apt-get update -y
@@ -66,6 +69,7 @@ pipeline {
     stage('Install Docker if missing') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if ! command -v docker >/dev/null 2>&1; then
             sudo apt-get update -y
@@ -86,6 +90,7 @@ pipeline {
       steps {
         dir('infrastructure') {
           sh '''
+            #!/bin/bash
             set -euxo pipefail
             terraform init -upgrade
             terraform fmt -check || true
@@ -100,6 +105,7 @@ pipeline {
     stage('Wait for EKS Cluster to be Ready') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
 
           echo "Waiting for EKS cluster: ${CLUSTER_NAME} in ${REGION} to become ACTIVE..."
@@ -173,6 +179,7 @@ pipeline {
     stage('Install eksctl if missing') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if ! command -v eksctl >/dev/null 2>&1; then
             ARCH=$(uname -m)
@@ -188,6 +195,7 @@ pipeline {
     stage('Install kubectl if missing') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER=$(curl -L -s https://dl.k8s.io/release/stable.txt)
@@ -202,6 +210,7 @@ pipeline {
     stage('Install Helm if missing') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if ! command -v helm >/dev/null 2>&1; then
             curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 -o /tmp/get_helm.sh
@@ -216,6 +225,7 @@ pipeline {
     stage('OIDC + IRSA (idempotent)') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           aws eks update-kubeconfig --region "${REGION}" --name "${CLUSTER_NAME}"
 
@@ -247,6 +257,7 @@ pipeline {
     stage('Install/Upgrade AWS Load Balancer Controller') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           aws eks update-kubeconfig --region "${REGION}" --name "${CLUSTER_NAME}"
 
@@ -285,6 +296,7 @@ pipeline {
     stage('Install yq (for YAML parsing)') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if ! command -v yq >/dev/null 2>&1; then
             sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
@@ -298,6 +310,7 @@ pipeline {
     stage('Apply Kubernetes Manifests') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           MAN_DIR="k8s-manifests"
           if [ ! -d "$MAN_DIR" ]; then
@@ -331,6 +344,7 @@ pipeline {
     stage('Access Application URL') {
       steps {
         sh '''
+          #!/bin/bash
           set -euxo pipefail
           if kubectl get ingress -o name >/dev/null 2>&1; then
             HOST=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
@@ -350,6 +364,7 @@ pipeline {
   post {
     always {
       sh '''
+        #!/bin/bash
         echo "=== Cluster status report ==="
         echo "--- Nodes ---"
         kubectl get nodes || true
