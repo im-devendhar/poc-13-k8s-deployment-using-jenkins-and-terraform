@@ -16,6 +16,11 @@ pipeline {
       steps {
         sh '''
         set -eux
+        if ! command -v unzip >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y unzip
+        fi
+
         if ! command -v aws >/dev/null 2>&1; then
           curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
           unzip -q /tmp/awscliv2.zip -d /tmp
