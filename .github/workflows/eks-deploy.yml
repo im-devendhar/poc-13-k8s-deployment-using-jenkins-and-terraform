@@ -19,230 +19,211 @@ jobs:
 
     steps:
 
-# Checkout Repo
-- name: Checkout Code
-  uses: actions/checkout@v4
+      # Checkout Repo
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
 
-# Install AWS CLI
-- name: Install AWS CLI
-  run: |
-    set -eux
-    if ! command -v unzip >/dev/null; then
-      sudo apt-get update
-      sudo apt-get install -y unzip
-    fi
+      # Install AWS CLI
+      - name: Install AWS CLI
+        run: |
+          set -eux
+          if ! command -v unzip >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y unzip
+          fi
 
-    if ! command -v aws >/dev/null; then
-      curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
-      unzip awscliv2.zip
-      sudo ./aws/install
-    fi
+          if ! command -v aws >/dev/null; then
+            curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
+            unzip awscliv2.zip
+            sudo ./aws/install
+          fi
 
-    aws --version
-
-
-# Configure AWS Credentials
-- name: Configure AWS Credentials
-  env:
-    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  run: |
-    aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-    aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-    aws configure set default.region "$REGION"
-    aws sts get-caller-identity
+          aws --version
 
 
-# Install Terraform
-- name: Install Terraform
-  run: |
-    set -eux
-    sudo apt-get update
-    sudo apt-get install -y gnupg software-properties-common wget
-
-    wget -O- https://apt.releases.hashicorp.com/gpg | \
-    gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
-
-    echo "deb [arch=$(dpkg --print-architecture) \
-    signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
-    https://apt.releases.hashicorp.com \
-    $(lsb_release -cs) main" | \
-    sudo tee /etc/apt/sources.list.d/hashicorp.list
-
-    sudo apt-get update
-    sudo apt-get install -y terraform
-
-    terraform -version
+      # Configure AWS Credentials
+      - name: Configure AWS Credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+          aws configure set default.region "$REGION"
+          aws sts get-caller-identity
 
 
-# Install Docker
-- name: Install Docker
-  run: |
-    set -eux
-    sudo apt-get update
-    sudo apt-get install -y docker.io
-    sudo systemctl enable docker
-    sudo systemctl start docker
-    docker --version
+      # Install Terraform
+      - name: Install Terraform
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y gnupg software-properties-common wget
+
+          wget -O- https://apt.releases.hashicorp.com/gpg | \
+          gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+          https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+          sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+          sudo apt-get update
+          sudo apt-get install -y terraform
+
+          terraform -version
 
 
-# Terraform Apply (Create EKS)
-- name: Terraform Apply
-  working-directory: infrastructure
-  run: |
-    terraform init
-    terraform validate
-    terraform plan -out=tfplan
-    terraform apply -auto-approve tfplan
+      # Install Docker
+      - name: Install Docker
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl enable docker
+          sudo systemctl start docker
+          docker --version
 
 
-# Wait for EKS Cluster
-- name: Wait for EKS Cluster
-  run: |
-    echo "Waiting for EKS cluster..."
-
-    while true; do
-      STATUS=$(aws eks describe-cluster \
-      --name "$CLUSTER_NAME" \
-      --region "$REGION" \
-      --query "cluster.status" \
-      --output text || echo "CREATING")
-
-      echo "Cluster Status = $STATUS"
-
-      if [ "$STATUS" = "ACTIVE" ]; then
-        echo "Cluster Ready"
-        break
-      fi
-
-      sleep 30
-    done
+      # Terraform Apply (Create EKS)
+      - name: Terraform Apply
+        working-directory: infrastructure
+        run: |
+          terraform init
+          terraform validate
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
 
 
-# Install eksctl
-- name: Install eksctl
-  run: |
-    curl -sL https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz \
-    | tar xz -C /tmp
+      # Wait for EKS Cluster
+      - name: Wait for EKS Cluster
+        run: |
+          echo "Waiting for EKS cluster..."
 
-    sudo mv /tmp/eksctl /usr/local/bin
-    eksctl version
+          while true; do
+            STATUS=$(aws eks describe-cluster \
+            --name "$CLUSTER_NAME" \
+            --region "$REGION" \
+            --query "cluster.status" \
+            --output text || echo "CREATING")
 
+            echo "Cluster Status = $STATUS"
 
-# Install kubectl
-- name: Install kubectl
-  run: |
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s \
-    https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            if [ "$STATUS" = "ACTIVE" ]; then
+              echo "Cluster Ready"
+              break
+            fi
 
-    sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-
-    kubectl version --client
-
-
-# Install Helm
-- name: Install Helm
-  run: |
-    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-    helm version
+            sleep 30
+          done
 
 
-# Configure OIDC + IRSA
-- name: Configure OIDC + IRSA
-  run: |
-
-    aws eks update-kubeconfig \
-    --region "$REGION" \
-    --name "$CLUSTER_NAME"
-
-    eksctl utils associate-iam-oidc-provider \
-    --cluster "$CLUSTER_NAME" \
-    --region "$REGION" \
-    --approve
-
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-    POLICY_ARN="arn:aws:iam::$ACCOUNT_ID:policy/$POLICY_NAME"
-
-    if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
-      curl -o iam-policy.json \
-      https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
-
-      aws iam create-policy \
-      --policy-name "$POLICY_NAME" \
-      --policy-document file://iam-policy.json
-    fi
-
-    eksctl create iamserviceaccount \
-    --cluster "$CLUSTER_NAME" \
-    --namespace "$SA_NAMESPACE" \
-    --name "$SA_NAME" \
-    --attach-policy-arn "$POLICY_ARN" \
-    --approve \
-    --override-existing-serviceaccounts
+      # Install eksctl
+      - name: Install eksctl
+        run: |
+          curl -sL https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+          eksctl version
 
 
-# Install AWS Load Balancer Controller
-- name: Install AWS Load Balancer Controller
-  run: |
-
-    kubectl apply -f \
-    https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml
-
-    helm repo add eks https://aws.github.io/eks-charts
-    helm repo update
-
-    VPC_ID=$(aws eks describe-cluster \
-    --name "$CLUSTER_NAME" \
-    --region "$REGION" \
-    --query "cluster.resourcesVpcConfig.vpcId" \
-    --output text)
-
-    helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
-    -n kube-system \
-    --set clusterName="$CLUSTER_NAME" \
-    --set serviceAccount.create=false \
-    --set serviceAccount.name="$SA_NAME" \
-    --set region="$REGION" \
-    --set vpcId="$VPC_ID"
-
-    kubectl rollout status deployment/aws-load-balancer-controller -n kube-system
+      # Install kubectl
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client
 
 
-# Deploy Application
-- name: Deploy Kubernetes Application
-  run: |
-
-    kubectl apply -f k8s-manifests/namespace.yaml || true
-    kubectl apply -f k8s-manifests/deployment.yaml
-    kubectl apply -f k8s-manifests/service.yaml
-    kubectl apply -f k8s-manifests/ingress.yaml || true
-
-    kubectl get pods
-    kubectl get svc
+      # Install Helm
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm version
 
 
-# Get Application URL
-- name: Get Application URL
-  run: |
+      # Configure OIDC + IRSA
+      - name: Configure OIDC + IRSA
+        run: |
+          aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
 
-    HOST=$(kubectl get ingress \
-    -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' || true)
+          eksctl utils associate-iam-oidc-provider \
+          --cluster "$CLUSTER_NAME" \
+          --region "$REGION" \
+          --approve
 
-    if [ -n "$HOST" ]; then
-      echo "Application URL:"
-      echo "http://$HOST"
-    else
-      echo "Ingress hostname not ready yet."
-    fi
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          POLICY_ARN="arn:aws:iam::$ACCOUNT_ID:policy/$POLICY_NAME"
+
+          if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
+            curl -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+            aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://iam-policy.json
+          fi
+
+          eksctl create iamserviceaccount \
+          --cluster "$CLUSTER_NAME" \
+          --namespace "$SA_NAMESPACE" \
+          --name "$SA_NAME" \
+          --attach-policy-arn "$POLICY_ARN" \
+          --approve \
+          --override-existing-serviceaccounts
 
 
-# Post Deployment Report
-- name: Cluster Status Report
-  if: always()
-  run: |
-    kubectl get nodes || true
-    kubectl get pods -A || true
-    kubectl get svc -A || true
-    kubectl get ingress -A || true
+      # Install AWS Load Balancer Controller
+      - name: Install AWS Load Balancer Controller
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml
+
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+
+          VPC_ID=$(aws eks describe-cluster \
+          --name "$CLUSTER_NAME" \
+          --region "$REGION" \
+          --query "cluster.resourcesVpcConfig.vpcId" \
+          --output text)
+
+          helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
+          -n kube-system \
+          --set clusterName="$CLUSTER_NAME" \
+          --set serviceAccount.create=false \
+          --set serviceAccount.name="$SA_NAME" \
+          --set region="$REGION" \
+          --set vpcId="$VPC_ID"
+
+          kubectl rollout status deployment/aws-load-balancer-controller -n kube-system
+
+
+      # Deploy Application
+      - name: Deploy Kubernetes Application
+        run: |
+          kubectl apply -f k8s-manifests/namespace.yaml || true
+          kubectl apply -f k8s-manifests/deployment.yaml
+          kubectl apply -f k8s-manifests/service.yaml
+          kubectl apply -f k8s-manifests/ingress.yaml || true
+
+          kubectl get pods
+          kubectl get svc
+
+
+      # Get Application URL
+      - name: Get Application URL
+        run: |
+          HOST=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' || true)
+
+          if [ -n "$HOST" ]; then
+            echo "Application URL:"
+            echo "http://$HOST"
+          else
+            echo "Ingress hostname not ready yet."
+          fi
+
+
+      # Post Deployment Report
+      - name: Cluster Status Report
+        if: always()
+        run: |
+          kubectl get nodes || true
+          kubectl get pods -A || true
+          kubectl get svc -A || true
+          kubectl get ingress -A || true
