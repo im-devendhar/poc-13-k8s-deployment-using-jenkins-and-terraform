@@ -1,0 +1,266 @@
+pipeline {
+  agent any
+
+  environment {
+    CLUSTER_NAME = 'eks-cluster'
+    REGION       = 'us-east-1'
+    SA_NAMESPACE = 'kube-system'
+    SA_NAME      = 'aws-load-balancer-controller'
+    POLICY_NAME  = 'AWSLoadBalancerControllerIAMPolicy'
+    // Make sure /usr/local/bin is in PATH for tools we place there
+    PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"
+  }
+
+  stages {
+
+    stage('Install AWS CLI (v2) ') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if ! command -v aws >/dev/null 2>&1; then
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+          aws --version
+        '''
+      }
+    }
+
+    stage('Configure AWS (Jenkins credentials)') {
+      steps {
+        withCredentials([
+          string(credentialsId: 'aws_access_key_id',     variable: 'AWS_ACCESS_KEY_ID'),
+          string(credentialsId: 'aws_secret_access_key', variable: 'AWS_SECRET_ACCESS_KEY')
+        ]) {
+          sh '''
+            set -euxo pipefail
+            aws configure set aws_access_key_id     "$AWS_ACCESS_KEY_ID"
+            aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+            aws configure set default.region        '"$REGION"'
+            aws sts get-caller-identity --output text
+          '''
+        }
+      }
+    }
+
+    stage('Install Terraform (HashiCorp APT)') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if ! command -v terraform >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y gnupg software-properties-common wget
+            if [ ! -f /usr/share/keyrings/hashicorp-archive-keyring.gpg ]; then
+              wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+            fi
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt-get update -y
+            sudo apt-get install -y terraform
+          fi
+          terraform -version
+        '''
+      }
+    }
+
+    stage('Install Docker if missing') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y ca-certificates curl gnupg lsb-release
+            sudo install -m 0755 -d /etc/apt/keyrings || true
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update -y
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            sudo usermod -aG docker "$USER" || true
+          fi
+          docker --version || true
+        '''
+      }
+    }
+
+    stage('Terraform Init/Plan/Apply') {
+      steps {
+        dir('infrastructure') {
+          sh '''
+            set -euxo pipefail
+            terraform init -upgrade
+            terraform fmt -check || true
+            terraform validate
+            terraform plan -out=tfplan
+            terraform apply -auto-approve tfplan
+          '''
+        }
+      }
+    }
+
+    stage('Install eksctl if missing') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if ! command -v eksctl >/dev/null 2>&1; then
+            ARCH=$(uname -m)
+            curl -sSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_${ARCH}.tar.gz" -o /tmp/eksctl.tgz
+            tar -xzf /tmp/eksctl.tgz -C /tmp
+            sudo mv /tmp/eksctl /usr/local/bin/eksctl
+          fi
+          eksctl version
+        '''
+      }
+    }
+
+    stage('Install kubectl if missing') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KVER=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+            curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+            sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          fi
+          kubectl version --client=true
+        '''
+      }
+    }
+
+    stage('Install Helm if missing') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if ! command -v helm >/dev/null 2>&1; then
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 -o /tmp/get_helm.sh
+            chmod +x /tmp/get_helm.sh
+            sudo /tmp/get_helm.sh
+          fi
+          helm version
+        '''
+      }
+    }
+
+    stage('OIDC + IRSA (idempotent)') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          aws eks update-kubeconfig --region "${REGION}" --name "${CLUSTER_NAME}"
+
+          # 1) OIDC
+          eksctl utils associate-iam-oidc-provider --cluster "${CLUSTER_NAME}" --region "${REGION}" --approve
+
+          # 2) IAM policy for AWS LBC
+          POLICY_ARN="arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):policy/${POLICY_NAME}"
+          if ! aws iam get-policy --policy-arn "${POLICY_ARN}" >/dev/null 2>&1; then
+            curl -fsSL https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json -o /tmp/iam-policy.json
+            aws iam create-policy --policy-name "${POLICY_NAME}" --policy-document file:///tmp/iam-policy.json >/dev/null
+          fi
+
+          # 3) ServiceAccount with IRSA (safe to re-run)
+          eksctl create iamserviceaccount \
+            --cluster "${CLUSTER_NAME}" \
+            --region  "${REGION}" \
+            --namespace "${SA_NAMESPACE}" \
+            --name "${SA_NAME}" \
+            --attach-policy-arn "${POLICY_ARN}" \
+            --approve \
+            --override-existing-serviceaccounts
+
+          kubectl -n "${SA_NAMESPACE}" get sa "${SA_NAME}" -o yaml | sed -n '1,60p'
+        '''
+      }
+    }
+
+    stage('Install/Upgrade AWS Load Balancer Controller') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          aws eks update-kubeconfig --region "${REGION}" --name "${CLUSTER_NAME}"
+
+          # CRDs
+          kubectl apply -f https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml
+
+          # Helm repo
+          if ! helm repo list | awk '{print $1}' | grep -qx eks; then
+            helm repo add eks https://aws.github.io/eks-charts
+          fi
+          helm repo update
+
+          # VPC id
+          VPC_ID=$(aws eks describe-cluster --name "${CLUSTER_NAME}" --region "${REGION}" --query "cluster.resourcesVpcConfig.vpcId" --output text)
+
+          # Install/upgrade
+          helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
+            -n "${SA_NAMESPACE}" \
+            --set clusterName="${CLUSTER_NAME}" \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name="${SA_NAME}" \
+            --set region="${REGION}" \
+            --set vpcId="${VPC_ID}"
+
+          kubectl -n "${SA_NAMESPACE}" rollout status deploy/aws-load-balancer-controller --timeout=300s
+        '''
+      }
+    }
+
+    stage('Checkout application repo') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Apply Kubernetes Manifests') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          # Adjust folder name if your repo uses k8s-manifests
+          MAN_DIR="k8s-manifests"
+          if [ ! -d "$MAN_DIR" ]; then
+            echo "Folder $MAN_DIR not found. If your path is k8s-manifest/, change MAN_DIR variable."
+            ls -la
+            exit 1
+          fi
+
+          # Ensure namespace exists if you keep a separate namespace yaml
+          kubectl apply -f "$MAN_DIR/namespace.yaml" || true
+
+          kubectl apply -f "$MAN_DIR/deployment.yaml"
+          kubectl apply -f "$MAN_DIR/service.yaml"
+          kubectl apply -f "$MAN_DIR/ingress.yaml" || true
+
+          # Rollout wait (reads name from deployment file)
+          DEPLOY_NAME=$(yq '.metadata.name' "$MAN_DIR/deployment.yaml")
+          kubectl rollout status deploy/${DEPLOY_NAME} --timeout=180s || true
+
+          kubectl get pods -o wide
+          kubectl get svc  -o wide
+          kubectl get ingress -o wide || true
+        '''
+      }
+    }
+
+    stage('Access Application URL') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if kubectl get ingress -o name >/dev/null 2>&1; then
+            HOST=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+            echo "Application URL (if ready): http://${HOST}"
+          else
+            echo "No Ingress found."
+          fi
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      sh '''
+        echo "=== Diagnostics ==="
+        kubectl get nodes || true
+        kubectl get all -A | head -n 60 || true
+      '''
+    }
+  }
+}
