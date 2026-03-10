@@ -37,7 +37,7 @@ pipeline {
             set -euxo pipefail
             aws configure set aws_access_key_id     "$AWS_ACCESS_KEY_ID"
             aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-            aws configure set default.region        '"$REGION"'
+            aws configure set default.region        "$REGION"
             aws sts get-caller-identity --output text
           '''
         }
@@ -94,6 +94,64 @@ pipeline {
             terraform apply -auto-approve tfplan
           '''
         }
+      }
+    }
+
+    stage('Wait for EKS Cluster to be Ready') {
+      steps {
+        sh '''
+          set -euxo pipefail
+
+          echo "Waiting for EKS cluster: ${CLUSTER_NAME} in ${REGION} to become ACTIVE..."
+
+          # Wait until cluster status becomes ACTIVE
+          while true; do
+            STATUS=$(aws eks describe-cluster \
+              --name "${CLUSTER_NAME}" \
+              --region "${REGION}" \
+              --query "cluster.status" \
+              --output text || echo "PENDING")
+
+            echo "Cluster Status = $STATUS"
+
+            if [ "$STATUS" = "ACTIVE" ]; then
+                echo "EKS Cluster is ACTIVE!"
+                break
+            fi
+
+            echo "Still creating... sleeping for 30 seconds"
+            sleep 30
+          done
+
+          # Optional: Wait until first nodegroup is ACTIVE (if any)
+          echo "Checking if nodegroups are ready..."
+          NG=$(aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --region "${REGION}" --query "nodegroups[0]" --output text || echo "None")
+
+          if [ "$NG" != "None" ] && [ -n "$NG" ]; then
+            while true; do
+              NG_STATUS=$(aws eks describe-nodegroup \
+                --cluster-name "${CLUSTER_NAME}" \
+                --nodegroup-name "$NG" \
+                --region "${REGION}" \
+                --query "nodegroup.status" \
+                --output text || echo "CREATING")
+
+              echo "Nodegroup ($NG) Status = $NG_STATUS"
+
+              if [ "$NG_STATUS" = "ACTIVE" ]; then
+                echo "Nodegroup is ACTIVE!"
+                break
+              fi
+
+              echo "Waiting for nodegroup... sleeping 30 sec"
+              sleep 30
+            done
+          else
+            echo "No managed nodegroups found yet (could be self-managed or created later)."
+          fi
+
+          echo "EKS Cluster + (optional) Nodegroup Ready!"
+        '''
       }
     }
 
@@ -257,7 +315,7 @@ pipeline {
   post {
     always {
       sh '''
-        echo "=== Diagnostics ==="
+        echo "=== Cluster status report ==="
         kubectl get nodes || true
         kubectl get all -A | head -n 60 || true
       '''
