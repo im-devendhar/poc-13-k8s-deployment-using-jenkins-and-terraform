@@ -104,7 +104,9 @@ pipeline {
 
           echo "Waiting for EKS cluster: ${CLUSTER_NAME} in ${REGION} to become ACTIVE..."
 
-          # Wait until cluster status becomes ACTIVE
+          # Max wait ~40 minutes (80 * 30s)
+          MAX=80
+          i=0
           while true; do
             STATUS=$(aws eks describe-cluster \
               --name "${CLUSTER_NAME}" \
@@ -119,6 +121,12 @@ pipeline {
                 break
             fi
 
+            i=$((i+1))
+            if [ $i -ge $MAX ]; then
+              echo "Timed out waiting for EKS cluster to become ACTIVE."
+              exit 1
+            fi
+
             echo "Still creating... sleeping for 30 seconds"
             sleep 30
           done
@@ -128,6 +136,7 @@ pipeline {
           NG=$(aws eks list-nodegroups --cluster-name "${CLUSTER_NAME}" --region "${REGION}" --query "nodegroups[0]" --output text || echo "None")
 
           if [ "$NG" != "None" ] && [ -n "$NG" ]; then
+            j=0
             while true; do
               NG_STATUS=$(aws eks describe-nodegroup \
                 --cluster-name "${CLUSTER_NAME}" \
@@ -141,6 +150,12 @@ pipeline {
               if [ "$NG_STATUS" = "ACTIVE" ]; then
                 echo "Nodegroup is ACTIVE!"
                 break
+              fi
+
+              j=$((j+1))
+              if [ $j -ge $MAX ]; then
+                echo "Timed out waiting for nodegroup $NG to become ACTIVE."
+                exit 1
               fi
 
               echo "Waiting for nodegroup... sleeping 30 sec"
@@ -267,11 +282,23 @@ pipeline {
       }
     }
 
+    stage('Install yq (for YAML parsing)') {
+      steps {
+        sh '''
+          set -euxo pipefail
+          if ! command -v yq >/dev/null 2>&1; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+          yq --version
+        '''
+      }
+    }
+
     stage('Apply Kubernetes Manifests') {
       steps {
         sh '''
           set -euxo pipefail
-          # Adjust folder name if your repo uses k8s-manifests
           MAN_DIR="k8s-manifests"
           if [ ! -d "$MAN_DIR" ]; then
             echo "Folder $MAN_DIR not found. If your path is k8s-manifest/, change MAN_DIR variable."
@@ -288,7 +315,11 @@ pipeline {
 
           # Rollout wait (reads name from deployment file)
           DEPLOY_NAME=$(yq '.metadata.name' "$MAN_DIR/deployment.yaml")
-          kubectl rollout status deploy/${DEPLOY_NAME} --timeout=180s || true
+          if [ -n "$DEPLOY_NAME" ] && kubectl get deploy "$DEPLOY_NAME" >/dev/null 2>&1; then
+            kubectl rollout status deploy/${DEPLOY_NAME} --timeout=180s || true
+          else
+            echo "Deployment name not found or resource missing; skipping rollout wait."
+          fi
 
           kubectl get pods -o wide
           kubectl get svc  -o wide
@@ -303,7 +334,11 @@ pipeline {
           set -euxo pipefail
           if kubectl get ingress -o name >/dev/null 2>&1; then
             HOST=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
-            echo "Application URL (if ready): http://${HOST}"
+            if [ -n "$HOST" ]; then
+              echo "Application URL (if ready): http://${HOST}"
+            else
+              echo "Ingress found but hostname not yet assigned. It can take a few minutes."
+            fi
           else
             echo "No Ingress found."
           fi
@@ -316,8 +351,14 @@ pipeline {
     always {
       sh '''
         echo "=== Cluster status report ==="
+        echo "--- Nodes ---"
         kubectl get nodes || true
-        kubectl get all -A | head -n 60 || true
+        echo "--- Pods (all namespaces) ---"
+        kubectl get pods -A || true
+        echo "--- Services (all namespaces) ---"
+        kubectl get svc -A || true
+        echo "--- Ingresses (all namespaces) ---"
+        kubectl get ingress -A || true
       '''
     }
   }
