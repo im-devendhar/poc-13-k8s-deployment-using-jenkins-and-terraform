@@ -89,17 +89,36 @@ jobs:
           terraform init -upgrade
           terraform destroy -auto-approve
 
+      
+      - name: Terraform Plan (detailed exit code)
+        id: plan
+        working-directory: infrastructure
+        run: |
+          set -euxo pipefail
+          terraform init -upgrade
+          terraform validate
+        # capture exit code without failing the step
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          CODE=$?
+          set -e
+
+          echo "code=${CODE}" >> "$GITHUB_OUTPUT"
+
+          if [ "$CODE" -eq 1 ]; then
+           echo "Terraform plan failed."
+           exit 1
+          elif [ "$CODE" -eq 0 ]; then
+           echo "No changes detected. Apply will be skipped."
+          else # CODE == 2
+           echo "Changes detected. Apply will run."
+          fi
 
       # Terraform Apply (Create EKS)
       - name: Terraform steps
+        if: steps.plan.outputs.code == '2'
         working-directory: infrastructure
-        run: |
-          
-         
-          terraform init
-          terraform validate
-          terraform plan -detailed-exitcode -out=tfplan
-          terraform apply -auto-approve tfplan
+        run: terraform apply -auto-approve tfplan
 
 
       # Wait for EKS Cluster
