@@ -1,7 +1,14 @@
 name: EKS Infrastructure + App Deployment
 
 on:
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
+    inputs:
+      destroy_first:
+        description: "Run 'terraform destroy' before plan/apply?"
+        type: boolean
+        default: false
 
 env:
   CLUSTER_NAME: eks-cluster
@@ -12,75 +19,68 @@ env:
 
 jobs:
   deploy:
+    # Use your self-hosted agent; ensure it has sudo and outbound internet
     runs-on: self-hosted
+    timeout-minutes: 90
 
     steps:
-
-      # Checkout Repo
+      # -------------------- Checkout --------------------
       - name: Checkout Code
         uses: actions/checkout@v4
 
-
-      # Install AWS CLI
+      # -------------------- AWS CLI ---------------------
       - name: Install AWS CLI
         run: |
-          set -eux
+          set -euxo pipefail
           if ! command -v unzip >/dev/null; then
-            sudo apt-get update
+            sudo apt-get update -y
             sudo apt-get install -y unzip
           fi
-
           if ! command -v aws >/dev/null; then
-            curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip
-            unzip awscliv2.zip
-            sudo ./aws/install
+            curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
           fi
-
           aws --version
 
-
-      # Configure AWS Credentials
       - name: Configure AWS Credentials
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
+          set -euxo pipefail
           aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
           aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
           aws configure set default.region "$REGION"
           aws sts get-caller-identity
 
-
-      # Install Terraform
+      # -------------------- Terraform -------------------
       - name: Install Terraform
         run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y gnupg software-properties-common wget
-
-          wget -O- https://apt.releases.hashicorp.com/gpg | \
-          gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg
-
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
-          https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
-          sudo tee /etc/apt/sources.list.d/hashicorp.list
-
-          sudo apt-get update
+          set -euxo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y gnupg software-properties-common wget lsb-release
+          if [ ! -f /usr/share/keyrings/hashicorp-archive-keyring.gpg ]; then
+            wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg >/dev/null
+          fi
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -y
           sudo apt-get install -y terraform
-
           terraform -version
 
-
-      # Install Docker
+      # -------------------- Docker (optional) -----------
       - name: Install Docker
         run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl enable docker
-          sudo systemctl start docker
+          set -euxo pipefail
+          if ! command -v docker >/dev/null; then
+            sudo apt-get update -y
+            sudo apt-get install -y docker.io
+            sudo systemctl enable docker
+            sudo systemctl start docker
+          fi
           docker --version
-      
+
+      # --------- Optional: Destroy first on manual run ----------
       - name: Terraform Destroy (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.destroy_first == 'true' }}
         working-directory: infrastructure
@@ -89,7 +89,7 @@ jobs:
           terraform init -upgrade
           terraform destroy -auto-approve
 
-      
+      # --------- Plan with -detailed-exitcode ---------------
       - name: Terraform Plan (detailed exit code)
         id: plan
         working-directory: infrastructure
@@ -97,160 +97,197 @@ jobs:
           set -euxo pipefail
           terraform init -upgrade
           terraform validate
-        # capture exit code without failing the step
+          # capture exit code without failing the step when code==2
           set +e
           terraform plan -detailed-exitcode -out=tfplan
           CODE=$?
           set -e
-
           echo "code=${CODE}" >> "$GITHUB_OUTPUT"
-
           if [ "$CODE" -eq 1 ]; then
-           echo "Terraform plan failed."
-           exit 1
+            echo "Terraform plan failed."
+            exit 1
           elif [ "$CODE" -eq 0 ]; then
-           echo "No changes detected. Apply will be skipped."
+            echo "No changes detected. Apply will be skipped."
           else # CODE == 2
-           echo "Changes detected. Apply will run."
+            echo "Changes detected. Apply will run."
           fi
 
-      # Terraform Apply (Create EKS)
-      - name: Terraform steps
+      # --------- Apply only when plan says there are changes -----
+      - name: Terraform Apply (Create/Update EKS)
         if: steps.plan.outputs.code == '2'
         working-directory: infrastructure
-        run: terraform apply -auto-approve tfplan
+        run: |
+          set -euxo pipefail
+          terraform apply -auto-approve tfplan
 
-
-      # Wait for EKS Cluster
+      # -------------------- Wait for EKS -----------------
       - name: Wait for EKS Cluster
         run: |
-          echo "Waiting for EKS cluster..."
-
+          set -euxo pipefail
+          echo "Waiting for EKS cluster ${CLUSTER_NAME} in ${REGION}..."
+          MAX=80 # ~40 min
+          i=0
           while true; do
             STATUS=$(aws eks describe-cluster \
-            --name "$CLUSTER_NAME" \
-            --region "$REGION" \
-            --query "cluster.status" \
-            --output text || echo "CREATING")
-
+              --name "$CLUSTER_NAME" \
+              --region "$REGION" \
+              --query "cluster.status" \
+              --output text || echo "CREATING")
             echo "Cluster Status = $STATUS"
-
             if [ "$STATUS" = "ACTIVE" ]; then
               echo "Cluster Ready"
               break
             fi
-
+            i=$((i+1))
+            if [ $i -ge $MAX ]; then
+              echo "Timed out waiting for EKS cluster to become ACTIVE."
+              exit 1
+            fi
             sleep 30
           done
 
-
-      # Install eksctl
+      # -------------------- eksctl -----------------------
       - name: Install eksctl
         run: |
-          curl -sL https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz | tar xz -C /tmp
-          sudo mv /tmp/eksctl /usr/local/bin
+          set -euxo pipefail
+          if ! command -v eksctl >/dev/null; then
+            ARCH=$(uname -m)
+            curl -sSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_${ARCH}.tar.gz" -o /tmp/eksctl.tgz
+            tar -xzf /tmp/eksctl.tgz -C /tmp
+            sudo mv /tmp/eksctl /usr/local/bin/eksctl
+          fi
           eksctl version
 
-
-      # Install kubectl
+      # -------------------- kubectl ----------------------
       - name: Install kubectl
         run: |
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          set -euxo pipefail
+          if ! command -v kubectl >/dev/null; then
+            KVER=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+            curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+            sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          fi
           kubectl version --client
 
-
-      # Install Helm
+      # -------------------- Helm -------------------------
       - name: Install Helm
         run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          set -euxo pipefail
+          if ! command -v helm >/dev/null; then
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 -o /tmp/get_helm.sh
+            chmod +x /tmp/get_helm.sh
+            sudo /tmp/get_helm.sh
+          fi
           helm version
 
-
-      # Configure OIDC + IRSA
+      # -------------- OIDC + IRSA + preflight ------------
       - name: Configure OIDC + IRSA
         run: |
+          set -euxo pipefail
           aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
 
+          # 1) OIDC (idempotent)
           eksctl utils associate-iam-oidc-provider \
-          --cluster "$CLUSTER_NAME" \
-          --region "$REGION" \
-          --approve
+            --cluster "$CLUSTER_NAME" \
+            --region "$REGION" \
+            --approve
 
+          # 2) Ensure the AWS LB Controller IAM policy exists (idempotent)
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
           POLICY_ARN="arn:aws:iam::$ACCOUNT_ID:policy/$POLICY_NAME"
 
           if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
-            curl -o -fsSL iam-policy.json \ https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+            curl -fsSL -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
             aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://iam-policy.json
           fi
 
+          # 3) Create/Update IRSA ServiceAccount (idempotent)
           eksctl create iamserviceaccount \
-          --cluster "$CLUSTER_NAME" \
-          --namespace "$SA_NAMESPACE" \
-          --name "$SA_NAME" \
-          --attach-policy-arn "$POLICY_ARN" \
-          --approve \
-          --override-existing-serviceaccounts
+            --cluster "$CLUSTER_NAME" \
+            --region "$REGION" \
+            --namespace "$SA_NAMESPACE" \
+            --name "$SA_NAME" \
+            --attach-policy-arn "$POLICY_ARN" \
+            --approve \
+            --override-existing-serviceaccounts
 
-          
+          # 4) Preflight checks: SA + annotation must exist
           if ! kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME" >/dev/null 2>&1; then
-           echo "ERROR: ServiceAccount $SA_NAMESPACE/$SA_NAME missing. IRSA creation failed." >&2
-           exit 1
+            echo "ERROR: ServiceAccount $SA_NAMESPACE/$SA_NAME missing. IRSA creation failed." >&2
+            exit 1
           fi
-
-          
           ROLE_ARN=$(kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' || true)
           if [ -z "$ROLE_ARN" ]; then
-           echo "ERROR: ServiceAccount $SA_NAMESPACE/$SA_NAME missing IRSA role-arn annotation." >&2
-           exit 1
+            echo "ERROR: ServiceAccount $SA_NAMESPACE/$SA_NAME missing IRSA role-arn annotation." >&2
+            exit 1
           fi
 
-
-
-      # Install AWS Load Balancer Controller
+      # --------- AWS Load Balancer Controller ------------
       - name: Install AWS Load Balancer Controller
         run: |
+          set -euxo pipefail
+          # CRDs
           kubectl apply -f https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml
 
-          helm repo add eks https://aws.github.io/eks-charts
+          # Helm repo
+          if ! helm repo list | awk '{print $1}' | grep -qx eks; then
+            helm repo add eks https://aws.github.io/eks-charts
+          fi
           helm repo update
 
+          # VPC id
           VPC_ID=$(aws eks describe-cluster \
-          --name "$CLUSTER_NAME" \
-          --region "$REGION" \
-          --query "cluster.resourcesVpcConfig.vpcId" \
-          --output text)
+            --name "$CLUSTER_NAME" \
+            --region "$REGION" \
+            --query "cluster.resourcesVpcConfig.vpcId" \
+            --output text)
 
+          # Install/upgrade using the pre-created IRSA SA
           helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
-          -n kube-system \
-          --set clusterName="$CLUSTER_NAME" \
-          --set serviceAccount.create=false \
-          --set serviceAccount.name="$SA_NAME" \
-          --set region="$REGION" \
-          --set vpcId="$VPC_ID"
+            -n "$SA_NAMESPACE" \
+            --set clusterName="$CLUSTER_NAME" \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name="$SA_NAME" \
+            --set region="$REGION" \
+            --set vpcId="$VPC_ID"
 
-          kubectl rollout status deployment/aws-load-balancer-controller -n kube-system
+          # Rollout + diagnostics on failure
+          set +e
+          kubectl -n "$SA_NAMESPACE" rollout status deploy/aws-load-balancer-controller --timeout=300s
+          R=$?
+          set -e
+          if [ $R -ne 0 ]; then
+            echo "Rollout failed; dumping diagnostics..."
+            kubectl -n "$SA_NAMESPACE" get deploy aws-load-balancer-controller -o wide || true
+            kubectl -n "$SA_NAMESPACE" describe deploy aws-load-balancer-controller || true
+            kubectl -n "$SA_NAMESPACE" get rs -l app.kubernetes.io/name=aws-load-balancer-controller || true
+            POD=$(kubectl -n "$SA_NAMESPACE" get pods -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+            if [ -n "${POD:-}" ]; then
+              kubectl -n "$SA_NAMESPACE" describe pod "$POD" || true
+              kubectl -n "$SA_NAMESPACE" logs "$POD" -c aws-load-balancer-controller --tail=200 || true
+            else
+              echo "No pods created yet (check ServiceAccount, webhook secret, image pull, or scheduling constraints)."
+            fi
+            exit 1
+          fi
 
-
-      # Deploy Application
+      # ----------------- Deploy Application ---------------
       - name: Deploy Kubernetes Application
         run: |
+          set -euxo pipefail
           kubectl apply -f k8s-manifests/namespace.yaml || true
           kubectl apply -f k8s-manifests/deployment.yaml
           kubectl apply -f k8s-manifests/service.yaml
           kubectl apply -f k8s-manifests/ingress.yaml || true
 
-          kubectl get pods
-          kubectl get svc
+          kubectl get pods -o wide
+          kubectl get svc -o wide
 
-
-      # Get Application URL
+      # ----------------- Get Application URL --------------
       - name: Get Application URL
         run: |
-          HOST=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' || true)
-
+          set -euxo pipefail
+          HOST=$(kubectl get ingress -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
           if [ -n "$HOST" ]; then
             echo "Application URL:"
             echo "http://$HOST"
@@ -258,12 +295,17 @@ jobs:
             echo "Ingress hostname not ready yet."
           fi
 
-
-      # Post Deployment Report
+      # ----------------- Post Deployment Report -----------
       - name: Cluster Status Report
         if: always()
         run: |
+          set +e
+          echo "=== Post-Deployment Cluster Overview ==="
+          echo "--- Nodes ---"
           kubectl get nodes || true
+          echo "--- Pods (all namespaces) ---"
           kubectl get pods -A || true
+          echo "--- Services (all namespaces) ---"
           kubectl get svc -A || true
+          echo "--- Ingresses (all namespaces) ---"
           kubectl get ingress -A || true
