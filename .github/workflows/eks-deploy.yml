@@ -1,9 +1,6 @@
 name: EKS Infrastructure + App Deployment
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 env:
@@ -156,7 +153,7 @@ jobs:
           POLICY_ARN="arn:aws:iam::$ACCOUNT_ID:policy/$POLICY_NAME"
 
           if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
-            curl -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+            curl -o -fsSL iam-policy.json \ https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
             aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://iam-policy.json
           fi
 
@@ -167,6 +164,20 @@ jobs:
           --attach-policy-arn "$POLICY_ARN" \
           --approve \
           --override-existing-serviceaccounts
+
+          
+          if ! kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME" >/dev/null 2>&1; then
+           echo "ERROR: ServiceAccount $SA_NAMESPACE/$SA_NAME missing. IRSA creation failed." >&2
+           exit 1
+          fi
+
+          
+          ROLE_ARN=$(kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}' || true)
+          if [ -z "$ROLE_ARN" ]; then
+           echo "ERROR: ServiceAccount $SA_NAMESPACE/$SA_NAME missing IRSA role-arn annotation." >&2
+           exit 1
+          fi
+
 
 
       # Install AWS Load Balancer Controller
