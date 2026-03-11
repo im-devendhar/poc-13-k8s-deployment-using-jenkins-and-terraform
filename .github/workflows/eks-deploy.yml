@@ -1,14 +1,7 @@
 name: EKS Infrastructure + App Deployment
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
-    inputs:
-      destroy_first:
-        description: "Run 'terraform destroy' before plan/apply?"
-        type: boolean
-        default: false
 
 env:
   CLUSTER_NAME: eks-cluster
