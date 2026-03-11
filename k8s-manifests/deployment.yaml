@@ -2,20 +2,22 @@ apiVersion: apps/v1
 kind: Deployment
 metadata: 
   name: endhunger-deployment
+  namespace: endhunger
   labels:
     app: endhunger-web
 spec:
   replicas: 2
   selector:
     matchLabels:
-     app: endhunger-web
+      app: endhunger-web              
   template:
     metadata:
-    labels:
-      app: endhunger-web
+      labels:
+        app: endhunger-web             
     spec:
       containers:
-      - name: endhunger
-        image: devenops641/endhunger
-        ports:
-        - containerPort: 80 
+        - name: endhunger
+          image: devenops641/endhunger
+          ports:
+            - containerPort: 80
+         
