@@ -169,7 +169,7 @@ jobs:
         fi
         helm version
 
-    # -------------- OIDC + IAM Policy + IRSA Role (no eksctl SA) ------
+    # -------------- OIDC + IAM Policy + IRSA Role (Helm will create SA) ------
     - name: Configure OIDC + IRSA (create IAM role; Helm will create SA)
       run: |
         set -euxo pipefail
@@ -200,24 +200,31 @@ jobs:
         ROLE_NAME="alb-controller-irsa-${CLUSTER_NAME}-${SA_NAMESPACE}-${SA_NAME}"
 
         if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-          cat > trust-policy.json <<EOF
-          {
-            "Version": "2012-10-17",
-            "Statement": [
-              {
-                "Effect": "Allow",
-                "Principal": { "Federated": "arn:aws:iam::$ACCOUNT_ID:oidc-provider/$OIDC_PROVIDER" },
-                "Action": "sts:AssumeRoleWithWebIdentity",
-                "Condition": {
-                  "StringEquals": {
-                    "$OIDC_PROVIDER:aud": "sts.amazonaws.com",
-                    "$OIDC_PROVIDER:sub": "system:serviceaccount:${SA_NAMESPACE}:${SA_NAME}"
-                  }
-                }
-              }
-            ]
-          }
-          EOF
+          # Write JSON literal without variable expansion
+          cat > trust-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/OIDC_PROVIDER" },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "OIDC_PROVIDER:aud": "sts.amazonaws.com",
+          "OIDC_PROVIDER:sub": "system:serviceaccount:SA_NAMESPACE:SA_NAME"
+        }
+      }
+    }
+  ]
+}
+EOF
+          # Substitute placeholders safely
+          sed -i "s|ACCOUNT_ID|${ACCOUNT_ID}|g" trust-policy.json
+          sed -i "s|OIDC_PROVIDER|${OIDC_PROVIDER}|g" trust-policy.json
+          sed -i "s|SA_NAMESPACE|${SA_NAMESPACE}|g" trust-policy.json
+          sed -i "s|SA_NAME|${SA_NAME}|g" trust-policy.json
+
           aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file://trust-policy.json >/dev/null
           aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
         fi
@@ -248,7 +255,7 @@ jobs:
           --query "cluster.resourcesVpcConfig.vpcId" \
           --output text)
 
-        # Let Helm CREATE the ServiceAccount with the IRSA annotation (avoids eksctl SA 'excluded' issues)
+        # Helm creates the ServiceAccount with IRSA annotation (more reliable than eksctl SA in CI)
         helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
           -n "$SA_NAMESPACE" \
           --set clusterName="$CLUSTER_NAME" \
