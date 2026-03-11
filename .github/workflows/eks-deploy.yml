@@ -19,6 +19,9 @@ jobs:
     # -------------------- Checkout --------------------
     - name: Checkout Code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        ref: ${{github.sha }}
 
     # -------------------- AWS CLI ---------------------
     - name: Install AWS CLI
