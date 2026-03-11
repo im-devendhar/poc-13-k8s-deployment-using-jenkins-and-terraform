@@ -86,6 +86,7 @@ jobs:
       - name: Terraform Apply
         working-directory: infrastructure
         run: |
+          terraform destroy -auto-approve
           terraform init
           terraform validate
           terraform plan -out=tfplan
