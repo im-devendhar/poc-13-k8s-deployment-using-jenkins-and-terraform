@@ -111,7 +111,7 @@ jobs:
       run: |
         set -euxo pipefail
         echo "Waiting for EKS cluster ${CLUSTER_NAME} in ${REGION}..."
-        MAX=80  
+        MAX=80
         i=0
         while true; do
           STATUS=$(aws eks describe-cluster \
@@ -169,8 +169,8 @@ jobs:
         fi
         helm version
 
-    # -------------- OIDC + IRSA + IAM Policy + SA ------
-    - name: Configure OIDC + IRSA for ALB Controller
+    # -------------- OIDC + IAM Policy + IRSA Role (no eksctl SA) ------
+    - name: Configure OIDC + IRSA (create IAM role; Helm will create SA)
       run: |
         set -euxo pipefail
         aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
@@ -188,29 +188,43 @@ jobs:
         echo "=== Step 3: Create IAM Policy if not exists ==="
         ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
         POLICY_ARN="arn:aws:iam::$ACCOUNT_ID:policy/$POLICY_NAME"
-
         if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
           aws iam create-policy \
             --policy-name "$POLICY_NAME" \
             --policy-document file://iam-policy.json
         fi
 
-        echo "=== Step 4: IRSA ServiceAccount ==="
-        eksctl create iamserviceaccount \
-          --cluster "$CLUSTER_NAME" \
-          --namespace "$SA_NAMESPACE" \
-          --name "$SA_NAME" \
-          --attach-policy-arn "$POLICY_ARN" \
-          --region "$REGION" \
-          --override-existing-serviceaccounts \
-          --approve
+        echo "=== Step 4: Create/Ensure IRSA IAM Role (trusts this cluster's OIDC for SA ${SA_NAMESPACE}/${SA_NAME}) ==="
+        OIDC_ISSUER=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" --query 'cluster.identity.oidc.issuer' --output text)
+        OIDC_PROVIDER="${OIDC_ISSUER#https://}"
+        ROLE_NAME="alb-controller-irsa-${CLUSTER_NAME}-${SA_NAMESPACE}-${SA_NAME}"
 
-        echo "=== Step 5: Validate ServiceAccount ==="
-        kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME"
+        if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+          cat > trust-policy.json <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": { "Federated": "arn:aws:iam::$ACCOUNT_ID:oidc-provider/$OIDC_PROVIDER" },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "$OIDC_PROVIDER:aud": "sts.amazonaws.com",
+                    "$OIDC_PROVIDER:sub": "system:serviceaccount:${SA_NAMESPACE}:${SA_NAME}"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+          aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file://trust-policy.json >/dev/null
+          aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
+        fi
 
-        echo "=== Step 6: Validate IRSA Annotation ==="
-        ROLE_ARN=$(kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
-        echo "IRSA Role ARN: $ROLE_ARN"
+        ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+        echo "ROLE_ARN=${ROLE_ARN}" >> "$GITHUB_ENV"
+        echo "Configured IRSA IAM role: $ROLE_ARN"
 
     # --------- Install ALB CRDs ------------
     - name: Install ALB Controller CRDs
@@ -218,7 +232,7 @@ jobs:
         set -euxo pipefail
         kubectl apply -f https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml
 
-    # --------- AWS Load Balancer Controller -----
+    # --------- AWS Load Balancer Controller (Helm creates SA) -----
     - name: Install AWS Load Balancer Controller
       run: |
         set -euxo pipefail
@@ -234,11 +248,13 @@ jobs:
           --query "cluster.resourcesVpcConfig.vpcId" \
           --output text)
 
+        # Let Helm CREATE the ServiceAccount with the IRSA annotation (avoids eksctl SA 'excluded' issues)
         helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
           -n "$SA_NAMESPACE" \
           --set clusterName="$CLUSTER_NAME" \
-          --set serviceAccount.create=false \
+          --set serviceAccount.create=true \
           --set serviceAccount.name="$SA_NAME" \
+          --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$ROLE_ARN" \
           --set region="$REGION" \
           --set vpcId="$VPC_ID"
 
