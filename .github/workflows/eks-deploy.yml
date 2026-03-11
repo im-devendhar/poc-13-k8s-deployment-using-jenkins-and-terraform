@@ -1,8 +1,6 @@
 name: EKS Infrastructure + App Deployment
 
 on:
-  push:
-    branches: ["main"]
   workflow_dispatch:
 
 env:
@@ -36,7 +34,6 @@ jobs:
           sudo /tmp/aws/install
         fi
         aws --version
-
     - name: Configure AWS Credentials
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -47,7 +44,6 @@ jobs:
         aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
         aws configure set default.region "$REGION"
         aws sts get-caller-identity
-
     # -------------------- Terraform -------------------
     - name: Install Terraform
       run: |
@@ -62,7 +58,6 @@ jobs:
         sudo apt-get update -y
         sudo apt-get install -y terraform
         terraform -version
-
     # -------------------- Docker (optional) -----------
     - name: Install Docker
       run: |
@@ -74,7 +69,6 @@ jobs:
           sudo systemctl start docker
         fi
         docker --version
-
     # --------- Terraform Plan with -detailed-exitcode -----
     - name: Terraform Plan (detailed exit code)
       id: plan
@@ -83,14 +77,11 @@ jobs:
         set -euxo pipefail
         terraform init -upgrade
         terraform validate
-
         set +e
         terraform plan -detailed-exitcode -out=tfplan
         CODE=$?
         set -e
-
         echo "code=${CODE}" >> "$GITHUB_OUTPUT"
-
         if [ "$CODE" -eq 1 ]; then
           echo "Terraform plan failed."
           exit 1
@@ -99,7 +90,6 @@ jobs:
         else
           echo "Changes detected. Apply will run."
         fi
-
     # --------- Terraform Apply (when changes exist) -----
     - name: Terraform Apply (Create/Update EKS)
       if: steps.plan.outputs.code == '2'
@@ -107,13 +97,12 @@ jobs:
       run: |
         set -euxo pipefail
         terraform apply -auto-approve tfplan
-
     # -------------------- Wait for EKS -----------------
     - name: Wait for EKS Cluster
       run: |
         set -euxo pipefail
         echo "Waiting for EKS cluster ${CLUSTER_NAME} in ${REGION}..."
-        MAX=80
+        MAX=80  
         i=0
         while true; do
           STATUS=$(aws eks describe-cluster \
@@ -121,14 +110,11 @@ jobs:
             --region "$REGION" \
             --query "cluster.status" \
             --output text || echo "CREATING")
-
           echo "Cluster Status = $STATUS"
-
           if [ "$STATUS" = "ACTIVE" ]; then
             echo "Cluster Ready"
             break
           fi
-
           i=$((i+1))
           if [ $i -ge $MAX ]; then
             echo "Timed out waiting for EKS cluster to become ACTIVE."
@@ -136,7 +122,6 @@ jobs:
           fi
           sleep 30
         done
-
     # -------------------- eksctl -----------------------
     - name: Install eksctl
       run: |
@@ -148,7 +133,6 @@ jobs:
           sudo mv /tmp/eksctl /usr/local/bin/eksctl
         fi
         eksctl version
-
     # -------------------- kubectl ----------------------
     - name: Install kubectl
       run: |
@@ -159,7 +143,6 @@ jobs:
           sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
         fi
         kubectl version --client
-
     # -------------------- Helm -------------------------
     - name: Install Helm
       run: |
@@ -170,23 +153,19 @@ jobs:
           sudo /tmp/get_helm.sh
         fi
         helm version
-
-    # -------------- OIDC + IAM Policy + IRSA Role (Helm will create SA) ------
-    - name: Configure OIDC + IRSA (create IAM role; Helm will create SA)
+    # -------------- OIDC + IRSA + IAM Policy + SA ------
+    - name: Configure OIDC + IRSA for ALB Controller
       run: |
         set -euxo pipefail
         aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
-
         echo "=== Step 1: Associate OIDC Provider ==="
         eksctl utils associate-iam-oidc-provider \
           --cluster "$CLUSTER_NAME" \
           --region "$REGION" \
           --approve
-
         echo "=== Step 2: Download IAM Policy ==="
         curl -fsSL -o iam-policy.json \
           https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
-
         echo "=== Step 3: Create IAM Policy if not exists ==="
         ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
         POLICY_ARN="arn:aws:iam::$ACCOUNT_ID:policy/$POLICY_NAME"
@@ -195,80 +174,46 @@ jobs:
             --policy-name "$POLICY_NAME" \
             --policy-document file://iam-policy.json
         fi
-
-        echo "=== Step 4: Create/Ensure IRSA IAM Role (trusts this cluster's OIDC for SA ${SA_NAMESPACE}/${SA_NAME}) ==="
-        OIDC_ISSUER=$(aws #1 eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" --query 'cluster.identity.oidc.issuer' --output text)
-        OIDC_PROVIDER="${OIDC_ISSUER#https://}"
-        ROLE_NAME="alb-controller-irsa-${CLUSTER_NAME}-${SA_NAMESPACE}-${SA_NAME}"
-
-        if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
-          # Write JSON literal without variable expansion
-          cat > trust-policy.json <<'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": { "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/OIDC_PROVIDER" },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "OIDC_PROVIDER:aud": "sts.amazonaws.com",
-          "OIDC_PROVIDER:sub": "system:serviceaccount:SA_NAMESPACE:SA_NAME"
-        }
-      }
-    }
-  ]
-}
-EOF
-          # Substitute placeholders safely
-          sed -i "s|ACCOUNT_ID|${ACCOUNT_ID}|g" trust-policy.json
-          sed -i "s|OIDC_PROVIDER|${OIDC_PROVIDER}|g" trust-policy.json
-          sed -i "s|SA_NAMESPACE|${SA_NAMESPACE}|g" trust-policy.json
-          sed -i "s|SA_NAME|${SA_NAME}|g" trust-policy.json
-
-          aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file://trust-policy.json >/dev/null
-          aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
-        fi
-
-        ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
-        echo "ROLE_ARN=${ROLE_ARN}" >> "$GITHUB_ENV"
-        echo "Configured IRSA IAM role: $ROLE_ARN"
-
+        echo "=== Step 4: IRSA ServiceAccount ==="
+        eksctl create iamserviceaccount \
+          --cluster "$CLUSTER_NAME" \
+          --namespace "$SA_NAMESPACE" \
+          --name "$SA_NAME" \
+          --attach-policy-arn "$POLICY_ARN" \
+          --region "$REGION" \
+          --override-existing-serviceaccounts \
+          --approve
+        echo "=== Step 5: Validate ServiceAccount ==="
+        kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME"
+        echo "=== Step 6: Validate IRSA Annotation ==="
+        ROLE_ARN=$(kubectl -n "$SA_NAMESPACE" get sa "$SA_NAME" -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
+        echo "IRSA Role ARN: $ROLE_ARN"
     # --------- Install ALB CRDs ------------
     - name: Install ALB Controller CRDs
       run: |
         set -euxo pipefail
         kubectl apply -f https://raw.githubusercontent.com/aws/eks-charts/master/stable/aws-load-balancer-controller/crds/crds.yaml
-
-    # --------- AWS Load Balancer Controller (Helm creates SA) -----
+    # --------- AWS Load Balancer Controller -----
     - name: Install AWS Load Balancer Controller
       run: |
         set -euxo pipefail
-
         if ! helm repo list | awk '{print $1}' | grep -qx eks; then
           helm repo add eks https://aws.github.io/eks-charts
         fi
         helm repo update
-
         VPC_ID=$(aws eks describe-cluster \
           --name "$CLUSTER_NAME" \
           --region "$REGION" \
           --query "cluster.resourcesVpcConfig.vpcId" \
           --output text)
-
-        # Helm creates the ServiceAccount with IRSA annotation (more reliable than eksctl SA in CI)
         helm upgrade -i aws-load-balancer-controller eks/aws-load-balancer-controller \
           -n "$SA_NAMESPACE" \
           --set clusterName="$CLUSTER_NAME" \
-          --set serviceAccount.create=true \
+          --set serviceAccount.create=false \
           --set serviceAccount.name="$SA_NAME" \
-          --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$ROLE_ARN" \
           --set region="$REGION" \
           --set vpcId="$VPC_ID"
-
         kubectl -n "$SA_NAMESPACE" rollout status deploy/aws-load-balancer-controller --timeout=300s
-
     # ----------------- Deploy Application ---------------
     - name: Deploy Kubernetes Application
       run: |
@@ -277,10 +222,8 @@ EOF
         kubectl apply -f k8s-manifests/deployment.yaml
         kubectl apply -f k8s-manifests/service.yaml
         kubectl apply -f k8s-manifests/ingress.yaml || true
-
         kubectl get pods -o wide
         kubectl get svc -o wide
-
     # ----------------- Get Application URL --------------
     - name: Get Application URL
       run: |
@@ -291,7 +234,6 @@ EOF
         else
           echo "Ingress hostname not ready yet."
         fi
-
     # ----------------- Cluster Diagnostics ---------------
     - name: Cluster Status Report
       if: always()
