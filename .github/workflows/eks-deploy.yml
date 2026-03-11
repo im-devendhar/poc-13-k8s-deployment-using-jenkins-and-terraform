@@ -197,7 +197,7 @@ jobs:
         fi
 
         echo "=== Step 4: Create/Ensure IRSA IAM Role (trusts this cluster's OIDC for SA ${SA_NAMESPACE}/${SA_NAME}) ==="
-        OIDC_ISSUER=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" --query 'cluster.identity.oidc.issuer' --output text)
+        OIDC_ISSUER=$(aws #1 eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" --query 'cluster.identity.oidc.issuer' --output text)
         OIDC_PROVIDER="${OIDC_ISSUER#https://}"
         ROLE_NAME="alb-controller-irsa-${CLUSTER_NAME}-${SA_NAMESPACE}-${SA_NAME}"
 
