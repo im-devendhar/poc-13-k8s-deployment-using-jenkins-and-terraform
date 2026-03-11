@@ -6,7 +6,7 @@ metdata:
 spec:
   type: NodePort
   selector:
-    app: endhunger
+    app: endhunger-web
   ports:
    - port: 80
      targetPort: 80
