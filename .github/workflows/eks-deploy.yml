@@ -21,7 +21,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
-        ref: ${{github.sha }}
+        ref: ${{ github.sha }}
 
     # -------------------- AWS CLI ---------------------
     - name: Install AWS CLI
@@ -114,7 +114,7 @@ jobs:
       run: |
         set -euxo pipefail
         echo "Waiting for EKS cluster ${CLUSTER_NAME} in ${REGION}..."
-        MAX=80  
+        MAX=80
         i=0
         while true; do
           STATUS=$(aws eks describe-cluster \
@@ -142,12 +142,36 @@ jobs:
     - name: Install eksctl
       run: |
         set -euxo pipefail
-        if ! command -v eksctl >/dev/null; then
-          ARCH=$(uname -m)
-          curl -sSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$(uname -s)_${ARCH}.tar.gz" -o /tmp/eksctl.tgz
-          tar -xzf /tmp/eksctl.tgz -C /tmp
+
+        if ! command -v eksctl >/dev/null 2>&1; then
+          OS="$(uname -s)"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64)  ARCH_DL="amd64"  ;;
+            aarch64) ARCH_DL="arm64"  ;;
+            arm64)   ARCH_DL="arm64"  ;;
+            *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+          esac
+
+          URL="https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_${OS}_${ARCH_DL}.tar.gz"
+          TMP="/tmp/eksctl.tar.gz"
+
+          echo "Downloading eksctl from: $URL"
+          curl -fsSL -o "$TMP" "$URL"
+
+          # Ensure we actually downloaded a gzip (not an HTML error)
+          if ! file "$TMP" | grep -qi 'gzip compressed data'; then
+            echo "Downloaded file is not a gzip archive. Possible bad URL or GitHub rate limit." >&2
+            echo "First lines of response:" >&2
+            head -n 20 "$TMP" || true
+            exit 1
+          fi
+
+          tar -xzf "$TMP" -C /tmp
           sudo mv /tmp/eksctl /usr/local/bin/eksctl
+          sudo chmod +x /usr/local/bin/eksctl
         fi
+
         eksctl version
 
     # -------------------- kubectl ----------------------
@@ -251,13 +275,12 @@ jobs:
     - name: Deploy Kubernetes Application
       run: |
         set -euxo pipefail
-        kubectl apply -f k8s-manifests/namespace.yaml 
+        kubectl apply -f k8s-manifests/namespace.yaml
         kubectl apply -f k8s-manifests/deployment.yaml
         kubectl apply -f k8s-manifests/service.yaml
-        kubectl apply -f k8s-manifests/ingress.yaml 
+        kubectl apply -f k8s-manifests/ingress.yaml || true
 
-        kubectl get pods -o wide
-        kubectl get svc -o wide
+        kubectl -n endhunger get deploy,rs,po,svc -o wide
 
     # ----------------- Get Application URL --------------
     - name: Get Application URL
